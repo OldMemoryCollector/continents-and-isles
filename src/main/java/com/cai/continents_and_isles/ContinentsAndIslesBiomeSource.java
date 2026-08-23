@@ -11,7 +11,11 @@ import net.minecraft.world.level.biome.BiomeSource;
 import net.minecraft.world.level.biome.Climate;
 
 import java.util.ArrayList;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -59,7 +63,41 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
     /** 6 个固定扇区（0..5）的群系配置 */
     private SectorBiomeData[] sectorBiomeData;
 
-    /** 外岛群系黑名单（资源定位符），超大陆外围岛屿上禁止出现的群系 */
+    // ── 群系限制规则：区域枚举 & 缓存 ─────────────────────────────────────────
+    /** 可施加群系限制的区域。only_biomes 支持多区域并集（并集=写进多个区域 only_biomes 列表）。 */
+    enum RestrictRegion {
+        RING_MOUNTAIN,            // 环山带（独立于扇区，dist > 0.95R）
+        SECTOR_0, SECTOR_1, SECTOR_2, SECTOR_3, SECTOR_4, SECTOR_5, // 6 扇区
+        ARCHIPELAGO_INNER_ISLAND  // 群岛扇区内部小岛（独立于扇区 2 本体 & 外岛）
+    }
+
+    /** 单个群系限制规则（从配置字符串→ResourceLocation 解析完成后的缓存） */
+    private static final class BiomeRules {
+        final Set<ResourceLocation> supercontinentBlacklist = new HashSet<>();
+        final Set<ResourceLocation> outerIslandBlacklist    = new HashSet<>();
+        final Set<ResourceLocation> ringMountainBlacklist   = new HashSet<>();
+        final Set<ResourceLocation> ringMountainOnly        = new HashSet<>();
+        final List<Set<ResourceLocation>> sectorBlacklist   = new ArrayList<>(6);
+        final List<Set<ResourceLocation>> sectorOnly        = new ArrayList<>(6);
+        final Set<ResourceLocation> innerIslandBlacklist    = new HashSet<>();
+        final Set<ResourceLocation> innerIslandOnly         = new HashSet<>();
+        /** 反向索引：群系 ResourceLocation → 它被列进 only_biomes 的区域集合（并集白名单） */
+        final Map<ResourceLocation, EnumSet<RestrictRegion>> onlyIndex = new HashMap<>();
+
+        BiomeRules() {
+            for (int i = 0; i < 6; i++) {
+                sectorBlacklist.add(new HashSet<>());
+                sectorOnly.add(new HashSet<>());
+            }
+        }
+    }
+
+    /** 群系限制规则缓存（首次使用时解析配置） */
+    private BiomeRules biomeRules;
+
+    /** 外岛群系黑名单（资源定位符），超大陆外围岛屿上禁止出现的群系
+     *  @deprecated 已迁移到 BiomeRules.outerIslandBlacklist；保留字段避免直接引用崩溃，初始化时会同步填充。 */
+    @Deprecated
     private Set<ResourceLocation> outerIslandBlacklist = Set.of();
 
     /** Biomes O' Plenty 的 outback 群系（懒加载：模组未加载时为 null，沙漠扇区作为附属群系） */
@@ -209,19 +247,173 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
             this.islandChance = ContinentIslandField.continentIslandChance;
         }
         this.cfg = new ContinentIslandField.Config(this.radius, this.transition, this.grid, this.islandChance);
-        // 同时初始化外岛群系黑名单
-        if (this.outerIslandBlacklist == null || this.outerIslandBlacklist.isEmpty()) {
-            this.outerIslandBlacklist = new java.util.HashSet<>();
+        // 初始化群系限制规则（黑名单 + only_biomes 反向索引）
+        ensureBiomeRules();
+    }
+
+    /** 懒加载 BiomeRules 并同步填充 legacy outerIslandBlacklist（保持向后引用兼容） */
+    private void ensureBiomeRules() {
+        if (this.biomeRules != null) return;
+        this.biomeRules = buildBiomeRules();
+        // 同步 legacy 字段（pickIslandBiome / isOuterIslandBlacklisted 仍可能直接引用）
+        this.outerIslandBlacklist = this.biomeRules.outerIslandBlacklist;
+    }
+
+    /** 从 CAIConfig 构建 BiomeRules（解析 23 项字符串→ResourceLocation，并预构建 onlyIndex） */
+    private BiomeRules buildBiomeRules() {
+        BiomeRules r = new BiomeRules();
+        try {
+            for (String s : CAIConfig.SUPERCONTINENT_BIOME_BLACKLIST.get()) parseAdd(s, r.supercontinentBlacklist);
+        } catch (Exception ignored) {}
+        try {
+            for (String s : CAIConfig.OUTER_ISLAND_BIOME_BLACKLIST.get()) parseAdd(s, r.outerIslandBlacklist);
+        } catch (Exception ignored) {}
+        try {
+            for (String s : CAIConfig.RING_MOUNTAIN_BIOME_BLACKLIST.get()) parseAdd(s, r.ringMountainBlacklist);
+        } catch (Exception ignored) {}
+        try {
+            for (String s : CAIConfig.RING_MOUNTAIN_ONLY_BIOMES.get()) {
+                ResourceLocation loc = parseLoc(s);
+                if (loc != null) {
+                    r.ringMountainOnly.add(loc);
+                    r.onlyIndex.computeIfAbsent(loc, k -> EnumSet.noneOf(RestrictRegion.class))
+                              .add(RestrictRegion.RING_MOUNTAIN);
+                }
+            }
+        } catch (Exception ignored) {}
+        // 6 扇区
+        var secBL = List.of(CAIConfig.SECTOR_0_BIOME_BLACKLIST, CAIConfig.SECTOR_1_BIOME_BLACKLIST,
+                            CAIConfig.SECTOR_2_BIOME_BLACKLIST, CAIConfig.SECTOR_3_BIOME_BLACKLIST,
+                            CAIConfig.SECTOR_4_BIOME_BLACKLIST, CAIConfig.SECTOR_5_BIOME_BLACKLIST);
+        var secOL = List.of(CAIConfig.SECTOR_0_ONLY_BIOMES, CAIConfig.SECTOR_1_ONLY_BIOMES,
+                            CAIConfig.SECTOR_2_ONLY_BIOMES, CAIConfig.SECTOR_3_ONLY_BIOMES,
+                            CAIConfig.SECTOR_4_ONLY_BIOMES, CAIConfig.SECTOR_5_ONLY_BIOMES);
+        var secReg = List.of(RestrictRegion.SECTOR_0, RestrictRegion.SECTOR_1, RestrictRegion.SECTOR_2,
+                             RestrictRegion.SECTOR_3, RestrictRegion.SECTOR_4, RestrictRegion.SECTOR_5);
+        for (int s = 0; s < 6; s++) {
             try {
-                for (String s : CAIConfig.OUTER_ISLAND_BIOME_BLACKLIST.get()) {
-                    if (s == null) continue;
-                    try {
-                        ResourceLocation loc = ResourceLocation.parse(s.trim());
-                        this.outerIslandBlacklist.add(loc);
-                    } catch (Exception ignored) {}
+                for (String str : secBL.get(s).get()) parseAdd(str, r.sectorBlacklist.get(s));
+            } catch (Exception ignored) {}
+            try {
+                RestrictRegion reg = secReg.get(s);
+                for (String str : secOL.get(s).get()) {
+                    ResourceLocation loc = parseLoc(str);
+                    if (loc != null) {
+                        r.sectorOnly.get(s).add(loc);
+                        r.onlyIndex.computeIfAbsent(loc, k -> EnumSet.noneOf(RestrictRegion.class))
+                                  .add(reg);
+                    }
                 }
             } catch (Exception ignored) {}
         }
+        // E. 群岛内岛
+        try {
+            for (String s : CAIConfig.ARCHIPELAGO_INNER_ISLAND_BIOME_BLACKLIST.get()) parseAdd(s, r.innerIslandBlacklist);
+        } catch (Exception ignored) {}
+        try {
+            for (String s : CAIConfig.ARCHIPELAGO_INNER_ISLAND_ONLY_BIOMES.get()) {
+                ResourceLocation loc = parseLoc(s);
+                if (loc != null) {
+                    r.innerIslandOnly.add(loc);
+                    r.onlyIndex.computeIfAbsent(loc, k -> EnumSet.noneOf(RestrictRegion.class))
+                              .add(RestrictRegion.ARCHIPELAGO_INNER_ISLAND);
+                }
+            }
+        } catch (Exception ignored) {}
+        return r;
+    }
+
+    private static ResourceLocation parseLoc(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.isEmpty()) return null;
+        try { return ResourceLocation.parse(t); } catch (Exception e) { return null; }
+    }
+    private static void parseAdd(String s, Set<ResourceLocation> set) {
+        ResourceLocation l = parseLoc(s);
+        if (l != null) set.add(l);
+    }
+
+    // ─── 统一群系限制过滤器 ────────────────────────────────────────────────
+    /**
+     * 当前点所在区域（用于 only_biomes 并集白名单判定）。
+     * 外岛/超大陆整体判定由调用方直接用 boolean 表达，不进 RestrictRegion（避免把「大陆整体」当 only_biomes 目标）。
+     * 传入的 EnumSet 可为空，为空视为「不命中任何 RestrictRegion 区域」。
+     *
+     * @param biome     候选群系
+     * @param inSupercontinent 当前点是否位于超大陆内（dist < radius + transition）
+     * @param isOuterIsland    当前点是否属于外海群岛（命中 pickIslandBiome 分支）
+     * @param isArchipelagoInnerIsland 当前点是否是群岛扇区内部小岛（命中 randomIslandBiome 分支）
+     * @param ringMountainHit  当前点是否命中环山带（dist > 0.95*R && ringMountainEnabled，进入环山带群系分支）
+     * @param sectorHit        当前点所属扇区（0..5，仅当在扇区逻辑分支内才传入；-1 表示不在扇区内）
+     * @param fallback         过滤不通过时的兜底群系（不得为 null）
+     * @return 过滤后的群系（通过=原群系；不通过=fallback）
+     */
+    private Holder<Biome> applyBiomeRules(Holder<Biome> biome,
+                                          boolean inSupercontinent,
+                                          boolean isOuterIsland,
+                                          boolean isArchipelagoInnerIsland,
+                                          boolean ringMountainHit,
+                                          int sectorHit,
+                                          Holder<Biome> fallback) {
+        if (biome == null) return fallback;
+        if (this.biomeRules == null) ensureBiomeRules();
+        BiomeRules r = this.biomeRules;
+        var keyOpt = biome.unwrapKey();
+        if (keyOpt.isEmpty()) return biome;
+        ResourceLocation loc = keyOpt.get().location();
+
+        // ① 超大陆整体黑名单（最高优先级）
+        if (inSupercontinent && r.supercontinentBlacklist.contains(loc)) return fallback;
+        // ② 外岛黑名单
+        if (isOuterIsland && r.outerIslandBlacklist.contains(loc)) return fallback;
+
+        // ③ 各区域独立黑名单（按当前点落在哪个限制区域来检查）
+        if (inSupercontinent) {
+            if (ringMountainHit && r.ringMountainBlacklist.contains(loc)) return fallback;
+            if (sectorHit >= 0 && sectorHit < 6 && r.sectorBlacklist.get(sectorHit).contains(loc)) return fallback;
+            if (isArchipelagoInnerIsland && r.innerIslandBlacklist.contains(loc)) return fallback;
+        }
+
+        // ④ only_biomes 并集白名单：若群系被任一区域的 only_biomes 收录，
+        //    则当前点必须同时属于其中至少一个允许区域；否则禁止。
+        EnumSet<RestrictRegion> allow = r.onlyIndex.get(loc);
+        if (allow != null && !allow.isEmpty()) {
+            boolean allowedRegionHit = false;
+            if (inSupercontinent) {
+                // 只要当前点在任一「命中区域」里就通过（并集）
+                if (ringMountainHit && allow.contains(RestrictRegion.RING_MOUNTAIN)) allowedRegionHit = true;
+                if (!allowedRegionHit && sectorHit >= 0 && sectorHit < 6) {
+                    RestrictRegion reg = switch (sectorHit) {
+                        case 0 -> RestrictRegion.SECTOR_0;
+                        case 1 -> RestrictRegion.SECTOR_1;
+                        case 2 -> RestrictRegion.SECTOR_2;
+                        case 3 -> RestrictRegion.SECTOR_3;
+                        case 4 -> RestrictRegion.SECTOR_4;
+                        case 5 -> RestrictRegion.SECTOR_5;
+                        default -> null;
+                    };
+                    if (reg != null && allow.contains(reg)) allowedRegionHit = true;
+                }
+                if (!allowedRegionHit && isArchipelagoInnerIsland
+                    && allow.contains(RestrictRegion.ARCHIPELAGO_INNER_ISLAND)) {
+                    allowedRegionHit = true;
+                }
+            }
+            if (!allowedRegionHit) return fallback;
+        }
+        return biome;
+    }
+
+    /** 简化版：扇区内（环带/群岛内岛为 false）的通用过滤，fallback = 对应扇区主群系 */
+    private Holder<Biome> applySectorRules(Holder<Biome> biome, int sector, double px, double pz, Holder<Biome> fallback) {
+        double dist = Math.sqrt(px * px + pz * pz);
+        boolean inSC = dist < this.radius + this.transition;
+        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+        // sectorHit 总是通过（sector 是外部给定）；环山带如果同时命中也要把环山带算进去。
+        // 但扇区内部调用时，环山带其实是独立区域——若当前点其实属于环山带范围，onlyIndex 需要同时检查环山带命中。
+        // 解决：同时传 ringMountainHit=true 当且仅当 dist>0.95R（这样 allow 中的 SECTOR_X 和 RING_MOUNTAIN 都能被命中）
+        return applyBiomeRules(biome, inSC, false, false, ringHit, sector, fallback);
     }
 
     public Holder<Biome> getNoiseBiome(int x, int y, int z, Climate.Sampler sampler) {
@@ -229,6 +421,10 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
         double bx = x * 4.0;
         double bz = z * 4.0;
         ContinentIslandField.Config cfg = this.cfg;
+        // 预计算 dist（晚一点也可以，但所有分支都需要判断是否在超大陆内）
+        double dist = 0.0;
+        boolean distComputed = false;
+        Holder<Biome> fallbackPlain = this.mainlandPool.get(1); // 兜底：平原
 
         // 林地府邸固定点：周围 128×128 格区域强制黑森林群系
         // （府邸是 80×80 格建筑且只能建在黑森林中，给足环境避免落在其他群系）
@@ -237,13 +433,22 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
             double mcx = mansionChunk.getMiddleBlockX();
             double mcz = mansionChunk.getMiddleBlockZ();
             if (Math.abs(bx - mcx) <= 64.0 && Math.abs(bz - mcz) <= 64.0) {
-                return this.mainlandPool.get(12); // dark_forest
+                if (!distComputed) { dist = Math.sqrt(bx*bx + bz*bz); distComputed = true; }
+                boolean inSC = dist < this.radius + this.transition;
+                boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+                // 林邸位置属于普通大陆区域（无扇区/内岛标志），扇区按 -1 走；通过 mask 自行判定若在扇区外
+                Holder<Biome> cand = this.mainlandPool.get(12);
+                return applyBiomeRules(cand, inSC, false, false, ringHit, sectorAt(bx, bz), fallbackPlain);
             }
         }
 
         // 必生成大湖（三个湖之一）
         double lake = ContinentIslandField.lakeValue(bx, bz, cfg);
         if (!Double.isNaN(lake)) {
+            if (!distComputed) { dist = Math.sqrt(bx*bx + bz*bz); distComputed = true; }
+            boolean inSC = dist < this.radius + this.transition;
+            boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+            int secAt = sectorAt(bx, bz);
             // 找到命中的湖
             int hit = -1;
             for (int i = 0; i < ContinentIslandField.LAKE_COUNT; i++) {
@@ -261,117 +466,126 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
                     if (biomeIdx == 22 && !allowSnow(bx, bz)) {
                         biomeIdx = 20; // 改为温水海洋
                     }
-                    return this.mainlandPool.get(biomeIdx);
+                    return applyBiomeRules(this.mainlandPool.get(biomeIdx), inSC, false, false, ringHit, secAt, this.mainlandPool.get(20));
                 }
                 if (type == 1) {
-                    // 深湖：湖面统一深海、湖岸陆地统一樱花树林——不再委托原版多噪声
-                    // （原版多噪声会把湖盆大陆度约 0.25 判成陆地群系，导致"深湖带森林/草甸"）
-                    // 山湖周围一圈樱花树林，与山峰扇区的樱花点缀呼应
+                    // 深湖：湖面统一深海、湖岸陆地统一樱花树林
                     double b = ContinentIslandField.bias(bx, bz, cfg);
-                    return b >= ContinentIslandField.LAND_BIAS_THRESHOLD
+                    Holder<Biome> base = (b >= ContinentIslandField.LAND_BIAS_THRESHOLD)
                         ? this.mainlandPool.get(CHERRY_GROVE)
                         : this.mainlandPool.get(DEEP_OCEAN);
+                    // 山湖在山脉扇区（0）：即使 hitSec 检测不到也给 0
+                    int mountainSec = 0;
+                    return applyBiomeRules(base, inSC, false, false, ringHit, mountainSec, this.mainlandPool.get(DEEP_OCEAN));
                 }
                 if (type == 2 && lake < 0) {
                     // 岛湖水面：固定普通海洋（湖中岛屿仍委托原版多噪声）
-                    return this.mainlandPool.get(ISLAND_SECTOR_OCEAN);
+                    return applyBiomeRules(this.mainlandPool.get(ISLAND_SECTOR_OCEAN), inSC, false, false, ringHit,
+                                           ContinentIslandField.ISLAND_SECTOR, this.mainlandPool.get(25));
                 }
             }
             // 岛湖/群系湖的岛屿：委托原版多噪声（水与岛群系自然给出），并过滤含雪群系
             Holder<Biome> delegateBiome = this.delegate.getNoiseBiome(x, y, z, sampler);
-            return (this.isExcluded(delegateBiome) || (isSnowy(delegateBiome) && !allowSnow(bx, bz)))
+            Holder<Biome> resolved = (this.isExcluded(delegateBiome) || (isSnowy(delegateBiome) && !allowSnow(bx, bz)))
                 ? this.pickMainlandBiome(x, y, z, sampler)
                 : delegateBiome;
+            return applyBiomeRules(resolved, inSC, false, false, ringHit, secAt, fallbackPlain);
         }
         // ===== 群岛-环山带过渡湿地浅滩带（0.80R~0.98R，限群岛扇区角度）=====
-        // 湿地带地形由 ArchipelagoWetland 独立计算拉向目标高度（Y≈62），
-        // 本处群系判定与地形共用 archipelagoWetlandBand，保证严格对齐。
-        // 【只进不退策略】沼泽只向内海方向延伸，绝不被海洋/其他群系侵入。
-        // 边缘用噪声控制沼泽延伸程度——有的地方沼泽多进、有的地方少进，形成犬牙交错。
         double wetBand = ContinentIslandField.archipelagoWetlandBand(bx, bz, this.radius);
         if (wetBand > 0.01) {
             logWetlandSample(bx, bz, wetBand);
+            if (!distComputed) { dist = Math.sqrt(bx*bx + bz*bz); distComputed = true; }
+            boolean inSC = dist < this.radius + this.transition;
+            boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+            // 湿地带落在群岛扇区角度范围 → 扇区 2 本体
+            Holder<Biome> cand;
             if (wetBand >= 0.10) {
-                // 湿地带主体：100% 沼泽/红树林
                 double wr = ContinentIslandField.valueNoise(bx, bz, 180, 9101);
-                return wr < 0.45
-                    ? this.mainlandPool.get(MANGROVE_SWAMP)
-                    : this.mainlandPool.get(SWAMP);
+                cand = (wr < 0.45) ? this.mainlandPool.get(MANGROVE_SWAMP) : this.mainlandPool.get(SWAMP);
+            } else {
+                // 带边缘（0.01~0.10）：只进不退
+                double baseT = (wetBand - 0.01) / 0.09;
+                double noise = ContinentIslandField.valueNoise(bx, bz, 40, 9102);
+                double swampProb = Math.min(1.0, baseT + noise * (1.0 - baseT) * 0.8);
+                if (swampProb > 0.25) {
+                    double wr = ContinentIslandField.valueNoise(bx, bz, 180, 9101);
+                    cand = (wr < 0.45) ? this.mainlandPool.get(MANGROVE_SWAMP) : this.mainlandPool.get(SWAMP);
+                } else {
+                    cand = this.mainlandPool.get(ISLAND_SECTOR_OCEAN);
+                }
             }
-            // 带边缘（0.01~0.10）：只进不退
-            double baseT = (wetBand - 0.01) / 0.09;
-            double noise = ContinentIslandField.valueNoise(bx, bz, 40, 9102);
-            double swampProb = Math.min(1.0, baseT + noise * (1.0 - baseT) * 0.8);
-            if (swampProb > 0.25) {
-                double wr = ContinentIslandField.valueNoise(bx, bz, 180, 9101);
-                return wr < 0.45
-                    ? this.mainlandPool.get(MANGROVE_SWAMP)
-                    : this.mainlandPool.get(SWAMP);
-            }
-            return this.mainlandPool.get(ISLAND_SECTOR_OCEAN);
+            return applyBiomeRules(cand, inSC, false, false, ringHit,
+                                   ContinentIslandField.ISLAND_SECTOR, this.mainlandPool.get(SWAMP));
         }
-        double dist = Math.sqrt(bx * bx + bz * bz);
+        if (!distComputed) { dist = Math.sqrt(bx*bx + bz*bz); distComputed = true; }
         if (dist < this.radius) {
             ContinentIslandField.Config cfgIsl = this.cfg;
-            // 群岛扇区：过渡带由 islandSectorFalloff（宽空间场）驱动，窗口 0.05 < falloff <= 0.34
-            // 与 ContinentIslandField.bias 的过渡权重 extW 完全对齐 → 群系和地形 1:1 匹配。
-            // 此窗口委托原版多噪声源，用实际气候参数（continents/erosion/offset）判定群系，
-            // 陆地 → 沙滩 → 浅海 → 深海 自然渐变，没有断崖、没有草地夹沙海错位。
             double islExtHere = ContinentIslandField.islandSectorFalloff(bx, bz, cfgIsl);
-            // 两侧海岸：不做任何人工干预。angMask 在群岛扇区外强制=0 → islExtHere=0，
-            // 自然落入下方 pickMainlandBiome（原版大陆群系），形成标准 MC 自然海岸线。
-            // 【沙滩带起点前移】起点 falloff 0.05 → 0.0534（对应径向 0.32R，压低带主体区），
-            // 终点 0.34 不动；沙滩带
-            // 整体落在压低带主体(0.30R~0.34R)上，不再外溢到缓坡区。
             if (islExtHere > 0.10) {
                 if (islExtHere <= 0.34) {
                     // ===== 沙滩带（falloff 0.0534~0.34）=====
-                    // 与 ArchipelagoTransition 的压低平坦段对齐：整个压低区域压到 Y64 浅滩，
-                    // 固定 beach 群系；内海方向大幅扩展，不再有"沙-海"缓冲带与草地错位。
-                    // 【沙滩带角度窗口】只在 delta < half*0.85（17°）内强制沙滩；
-                    // 0.85~1.00 之间压低带角度渐入已把地形回升到大陆高度，
-                    // 群系随之走大陆群系，保持"地形/群系"一致，避免两侧高地贴沙滩。
                     double bAngle = Math.atan2(bz, bx);
                     double bCenter = ContinentIslandField.sectorCenterAngle(ContinentIslandField.ISLAND_SECTOR);
                     double bDelta = Math.abs(Math.atan2(Math.sin(bAngle - bCenter), Math.cos(bAngle - bCenter)));
-                    double bHalf = ContinentIslandField.islandSectorHalfRad(); // 含群岛专用扩展，沙滩带跟随群岛扇区向两侧扩大
+                    double bHalf = ContinentIslandField.islandSectorHalfRad();
                     if (bDelta < bHalf * 0.85) {
-                        return this.mainlandPool.get(BEACH);
+                        Holder<Biome> cand = this.mainlandPool.get(BEACH);
+                        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+                        return applyBiomeRules(cand, true, false, false, ringHit,
+                                               ContinentIslandField.ISLAND_SECTOR, this.mainlandPool.get(BEACH));
                     }
-                    // 两侧收窄区（delta >= 17°）：地形已回升大陆高度，走大陆群系
+                    // 两侧收窄区：大陆群系
                     return this.pickMainlandBiome(x, y, z, sampler);
                 }
                 // falloff > 0.34：群岛内部正常群系（小岛/内海）
                 return this.pickMainlandBiome(x, y, z, sampler);
             }
-            // 大陆核心：少量群系、每种占大片面积（大尺度气候噪声驱动，地形起伏由噪声路由保证）
+            // 大陆核心
             return this.pickMainlandBiome(x, y, z, sampler);
         }
         boolean land = ContinentIslandField.bias(bx, bz, cfg) >= ContinentIslandField.LAND_BIAS_THRESHOLD;
-        // 海岸带（R <= dist < R+transition）命中外海岛几何时也走 pickIslandBiome：
-        // 岛心偏移 ±0.60 格 + 半径缩放可让外海岛向内「溢入」过渡带约 400 格，
-        // 若不拦截，溢出部分会被委托原版多噪声，同一岛屿被拆成多群系拼贴。
         boolean outerLandBleed = land
             && dist >= this.radius
             && dist < this.radius + this.transition
             && ContinentIslandField.isOuterIslandLand(bx, bz, cfg);
         if (((dist >= this.radius + this.transition && land) || outerLandBleed) && !this.islandPool.isEmpty()) {
-            // 外围岛屿（含溢入海岸带的部分）：每个岛屿固定一个群系
-            return this.pickIslandBiome(bx, bz, cfg);
+            // 外围岛屿：每个岛屿固定一个群系（内部自带 outer 黑名单 + 现在叠加规则过滤）
+            Holder<Biome> base = this.pickIslandBiome(bx, bz, cfg);
+            boolean inSC = dist < this.radius + this.transition;
+            // 外岛：传 sectorHit=-1（不在扇区）、ringHit=false（外岛不在大陆环山带）
+            return applyBiomeRules(base, inSC, true, false, false, -1, outerIslandFallback());
         }
-        // 超大陆、海岸带、外围深海：全部委托原版多噪声源。
-        // 沙滩不再强制生成——原版根据 continents/erosion/offset 等气候参数自主出现，
-        // 位置、宽度自然贴合地形，不会出现错位（草地带夹沙海）。
-        // 禁雪只限超大陆（dist < radius+transition）；外围深海/岛屿不禁雪
+        // 超大陆、海岸带、外围深海：委托原版多噪声源
         Holder<Biome> delegateBiome = this.delegate.getNoiseBiome(x, y, z, sampler);
         boolean snowBan = dist < this.radius + this.transition;
         Holder<Biome> resolved = (this.isExcluded(delegateBiome) || (snowBan && isSnowy(delegateBiome) && !allowSnow(bx, bz)))
             ? this.pickMainlandBiome(x, y, z, sampler)
             : delegateBiome;
-        if (dist >= this.radius + this.transition && land && isOuterIslandBlacklisted(resolved)) {
+        boolean inSC = dist < this.radius + this.transition;
+        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+        boolean outerIslandHere = (dist >= this.radius + this.transition && land);
+        resolved = applyBiomeRules(resolved, inSC, outerIslandHere, false, ringHit, sectorAt(bx, bz), fallbackPlain);
+        // 保持原有外岛黑名单兜底（legacy 逻辑，防止上面 applyBiomeRules 仅返回 fallback 但用户期望外岛专属兜底）
+        if (outerIslandHere && isOuterIslandBlacklisted(resolved)) {
             return outerIslandFallback();
         }
         return resolved;
+    }
+
+    /** 返回某坐标所属扇区（仅作「命中区域」参考：-1 表示不在任何扇区）。
+     *  用 best-mask 算法与 pickMainlandBiome 的扇区选择一致，threshold=0.22。 */
+    private int sectorAt(double px, double pz) {
+        ContinentIslandField.Config c = this.cfg;
+        double best = 0.0;
+        int bestS = -1;
+        for (int i = 0; i < 6; i++) {
+            double m = (i == MOUNTAIN_SECTOR)
+                ? ContinentIslandField.mountainValue(px, pz, this.radius)
+                : ContinentIslandField.sectorMask(i, px, pz, c);
+            if (m > best) { best = m; bestS = i; }
+        }
+        return (best >= 0.22) ? bestS : -1;
     }
 
     /** 湿地带采样日志（限 10 次）：打印湿地实际出现位置的角度与群岛扇区中心角，
@@ -576,6 +790,10 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
     /** 按扇区返回群系：0=山脉分级，2=群岛，其余扇区按配置化的主/附属群系权重选取。
      *  非山脉/群岛扇区先尝试混入其他模组群系点缀（原版为主、模组为辅）。 */
     private Holder<Biome> sectorBiome(int sector, double mask, double px, double pz, double dist, double angle, List<Holder<Biome>> pool, Climate.Sampler sampler) {
+        SectorBiomeData sdData = getSectorBiomeData()[sector];
+        Holder<Biome> sectorMain = (sdData != null && sdData.main() != null)
+            ? sdData.main() : pool.get(FALLBACK_SECTOR_MAIN[sector]);
+        // 扇区下：环带命中（dist > 0.95R）也作为环带参与 only 命中；applySectorRules 已内置
         if (sector == ContinentIslandField.ISLAND_SECTOR) {
             Holder<Biome> base = archipelagoBiome(mask, px, pz, dist, angle, pool);
             // 群岛扇区配置的附属群系作为额外点缀（陆地/浅水，不影响海洋神殿保留区）
@@ -585,10 +803,17 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
                     double r = ContinentIslandField.valueNoise(px, pz, 210, 52002);
                     double[] cum = sd.extrasCumulative();
                     for (int i = 0; i < cum.length; i++) {
-                        if (r < cum[i]) return sd.extras().get(i);
+                        if (r < cum[i]) {
+                            Holder<Biome> extra = sd.extras().get(i);
+                            // 附属点缀：命中群岛扇区本体（非内岛）
+                            boolean inSC = dist < this.radius + this.transition;
+                            boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+                            return applyBiomeRules(extra, inSC, false, false, ringHit, sector, sectorMain);
+                        }
                     }
                 }
             }
+            // base 已在 archipelagoBiome 内部过滤
             return base;
         }
         if (sector == MOUNTAIN_SECTOR) {
@@ -600,23 +825,27 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
                     double r = ContinentIslandField.valueNoise(px, pz, 220, 52000);
                     double[] cum = sd.extrasCumulative();
                     for (int i = 0; i < cum.length; i++) {
-                        if (r < cum[i]) return sd.extras().get(i);
+                        if (r < cum[i]) {
+                            Holder<Biome> e = sd.extras().get(i);
+                            return applySectorRules(e, sector, px, pz, sectorMain);
+                        }
                     }
                 }
             }
+            // base 已在 mountainRangeBiome 内过滤
             return base;
         }
-        // 非山脉/群岛扇区：自动发现的模组群系先点缀（~12%），然后再走配置化的主/附属权重
+        // 非山脉/群岛扇区
         Holder<Biome> extra = modExtraBiome(px, pz);
         if (extra != null) {
             extra = filterConfiguredBiome(extra, sector, px, pz, pool);
+            if (extra != null) extra = applySectorRules(extra, sector, px, pz, sectorMain);
         }
-        // 沙漠扇区专属：BOP outback 作为附属群系（少量小片点缀，约占 8%）。
-        // 阈值 0.92 + 尺度 220 → 稀疏小斑块；不会像恶地那样大范围铺开，沙漠仍为主体。
+        // 沙漠扇区专属：BOP outback
         if (sector == 3) {
             Holder<Biome> outback = bopOutback();
             if (outback != null && ContinentIslandField.valueNoise(px, pz, 220, 9101) > 0.92) {
-                return outback;
+                return applySectorRules(outback, sector, px, pz, sectorMain);
             }
         }
         Holder<Biome> configured = pickConfiguredSectorBiome(sector, px, pz, pool.get(FALLBACK_SECTOR_MAIN[sector]));
@@ -626,6 +855,7 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
             SectorBiomeData sd = getSectorBiomeData()[sector];
             configured = (sd != null && sd.main() != null) ? sd.main() : pool.get(FALLBACK_SECTOR_MAIN[sector]);
         }
+        configured = applySectorRules(configured, sector, px, pz, sectorMain);
         return (extra != null) ? extra : configured;
     }
 
@@ -681,17 +911,17 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
      * 群岛扇区：内海 + 小岛；沙滩不强制，由系统自主生成（原版多噪声源 + 地形自然配合）。
      */
     private Holder<Biome> archipelagoBiome(double mask, double px, double pz, double dist, double angle, List<Holder<Biome>> pool) {
+        boolean inSC = dist < this.radius + this.transition;
+        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+        int sector = ContinentIslandField.ISLAND_SECTOR;
+        Holder<Biome> fallbackOcean = pool.get(ISLAND_SECTOR_OCEAN);
         // ===== 海洋神殿保留区：一整片深海（deep ocean）=====
         if (ContinentIslandField.isInMonumentClear(px, pz)) {
-            return pool.get(DEEP_OCEAN);
+            return applyBiomeRules(pool.get(DEEP_OCEAN), inSC, false, false, ringHit, sector, fallbackOcean);
         }
         ContinentIslandField.Config cfg = this.cfg;
 
-        // ===== 分支1：群岛小岛陆地 =====
-        // 内部小岛就是岛屿群系（蘑菇岛等），岸边直接入海，沙滩系统自主决定
-        // 【群岛比内海小一圈】与地形层 bias() 的 w2 缓冲完全一致：内海边缘缓冲环
-        // （islExt <= 0.20）内地形不回升（bias 恒 -0.65 深海），群系层同样不给小岛群系，
-        // 避免内海边缘"地形是水、群系是小岛"的错位（其他群系跑上内海边缘的陆地）。
+        // ===== 分支1：群岛小岛陆地（= ARCHIPELAGO_INNER_ISLAND 独立区域）=====
         if (ContinentIslandField.islandSectorIsLand(px, pz)) {
             double bufExt = ContinentIslandField.islandSectorFalloff(px, pz, cfg);
             double bufMask = ContinentIslandField.islandSectorMask(px, pz, cfg);
@@ -699,7 +929,22 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
                 ? Mth.smoothstep((float) Mth.clamp((bufMask - 0.45) / 0.40, 0.0, 1.0))
                 : 0.0;
             if (bufW > 0.0) {
-                return randomIslandBiome(px, pz);
+                Holder<Biome> base = randomIslandBiome(px, pz);
+                // 群岛内岛：使用独立区域（不命中扇区2本体黑名单、不命中外岛限制）
+                // 注意：sector 仍传 ISLAND_SECTOR 以便 only_biomes 中"扇区2 only"也可命中（并集语义）
+                //  但黑名单层面：sector_2_blacklist 不影响内岛——传 sectorHit=-1 + 单独 isArchipelagoInnerIsland=true
+                //  而 only_biomes 的 SECTOR_2 命中需同时考虑——为此专门做两次判定。
+                // 实现：先仅按 ARCHIPELAGO_INNER_ISLAND 规则（sectorHit=-1），
+                // 再叠加 SECTOR_2 only 的放宽（把结果放宽）。
+                // 简化做法：构造一个允许"SECTOR_2 仅用于 only_biomes 匹配，不触发黑名单"的包装。
+                // 为避免复杂化，把群岛扇区本体 sector=2 不做 blacklist 的命中（传 -1），
+                // 同时仅对 only_biomes 并集时放宽——我们把 only 匹配前的命中区域在 applyBiomeRules 内部已处理
+                // only_biomes 并集用 sectorHit 或 ringHit 或 innerIsland 命中。
+                // 如果 sectorHit=-1 只触发 innerIsland only；我们希望内岛也能被 SECTOR_2_only 匹配时通过，
+                // 那就传 sectorHit=ISLAND_SECTOR，但同时不要触发 sector_2_blacklist。
+                // 解决：在 applyBiomeRules 内部不检查 sector 黑名单，当 isArchipelagoInnerIsland=true 时？
+                // 更直接：改为单独方法过滤内岛。
+                return applyInnerIslandRules(base, px, pz, dist, pool.get(13)); // 兜底草甸
             }
         }
 
@@ -707,144 +952,172 @@ public class ContinentsAndIslesBiomeSource extends BiomeSource {
         double finalBias = ContinentIslandField.bias(px, pz, cfg);
         boolean isLand = finalBias >= ContinentIslandField.LAND_BIAS_THRESHOLD;
         if (isLand) {
-            // 陆地：正常陆地群系（平原/森林/沼泽等），沙滩不再强制，自主生成
+            // 陆地：baseMainlandBiome 内部已做扇区规则过滤（扇区2本体）
             return baseMainlandBiome(px, pz, dist, angle, pool);
         }
 
         // ===== 分支3：水域 =====
-        // 【2026-08-22 注释掉】过渡带河网 biome 判定：
-        //   地形层 bias() 的过渡带河网侵蚀（挖掘河道）已整体删除，过渡带现已为纯线性
-        //   base→-0.65 海平面，海床平坦；继续在 biome 层强制贴 RIVER 群系会形成"幽灵
-        //   河流"——平坦海面上贴出河流群系的水色条带，并在 RIVER 群系边界自动生成沙
-        //   滩块，导致过渡水域出现与实际地形不匹配的奇怪沙滩/水色。先注释观察效果，
-        //   后续若恢复河道地形再同步解注释此处。
         /*
-        // 过渡带河网优先：外缘浅海的密细河道显示河流群系
         double trans = ContinentIslandField.islandTransitionWeight(px, pz, cfg);
         if (trans > 0.02 && ContinentIslandField.islandTransitionRiver(px, pz) > 0.5) {
             return pool.get(RIVER);
         }
         */
-        // 其余水域一律内海；沙滩由原版自主生成
-        return pool.get(ISLAND_SECTOR_OCEAN);
+        // 其余水域一律内海
+        return applyBiomeRules(pool.get(ISLAND_SECTOR_OCEAN), inSC, false, false, ringHit, sector, fallbackOcean);
+    }
+
+    /** 群岛内岛专属过滤：不触发 sector_2_blacklist、不触发 outer_island_blacklist，
+     *  但仍使用 SECTOR_2 的 only_biomes 做并集命中（即「群岛只允许」对内岛也视为合法）。 */
+    private Holder<Biome> applyInnerIslandRules(Holder<Biome> biome, double px, double pz, double dist, Holder<Biome> fallback) {
+        if (biome == null) return fallback;
+        if (this.biomeRules == null) ensureBiomeRules();
+        BiomeRules r = this.biomeRules;
+        var keyOpt = biome.unwrapKey();
+        if (keyOpt.isEmpty()) return biome;
+        ResourceLocation loc = keyOpt.get().location();
+        boolean inSC = dist < this.radius + this.transition;
+        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+
+        // ① 超大陆整体黑名单（最高优先级）
+        if (inSC && r.supercontinentBlacklist.contains(loc)) return fallback;
+        // ② 外岛黑名单：群岛内岛不在外岛，跳过
+
+        // ③ 各区域独立黑名单
+        if (inSC) {
+            if (ringHit && r.ringMountainBlacklist.contains(loc)) return fallback;
+            // 注意：扇区 2 黑名单对内岛不生效
+            if (r.innerIslandBlacklist.contains(loc)) return fallback;
+        }
+        // ④ only_biomes 并集：命中 RING_MOUNTAIN、SECTOR_2（群岛扇区本体）、ARCHIPELAGO_INNER_ISLAND 均算合法
+        EnumSet<RestrictRegion> allow = r.onlyIndex.get(loc);
+        if (allow != null && !allow.isEmpty()) {
+            boolean ok = false;
+            if (inSC) {
+                if (ringHit && allow.contains(RestrictRegion.RING_MOUNTAIN)) ok = true;
+                if (!ok && allow.contains(RestrictRegion.SECTOR_2)) ok = true;
+                if (!ok && allow.contains(RestrictRegion.ARCHIPELAGO_INNER_ISLAND)) ok = true;
+            }
+            if (!ok) return fallback;
+        }
+        return biome;
     }
 
     /**
      * 山脉扇区（模拟真实山脉）：按与地形完全一致的结构值（mountainValue，即参数 mask）分层。
-     * 结构值由蜿蜒 mask × 峰谷结构决定，与 MountainSector 的地形抬升数值完全相同——
-     * 群系永远跟实际山高走，不会错位。
-     * <ul>
-     *   <li>峰顶（结构值高）：按温度真实分带——寒=冰封峰顶、
-     *       温=积雪斑驳（细节噪声决定这座峰有没有雪）、热=秃岩峰（原版热带高山那样）</li>
-     *   <li>山腰：高山草甸 / 山坡针叶林（积雪山坡已禁止）</li>
-     *   <li>山脚/山谷：草甸/针叶林/森林（谷地结构值低，自然回落低地群系）</li>
-     * </ul>
      */
     private Holder<Biome> mountainRangeBiome(double mask, double px, double pz, List<Holder<Biome>> pool) {
+        int sector = MOUNTAIN_SECTOR;
+        Holder<Biome> fallback = pool.get(FALLBACK_SECTOR_MAIN[MOUNTAIN_SECTOR]); // meadow
         double temp = ContinentIslandField.valueNoise(px, pz, 400, 707);
         if (mask > 0.55) {
-            // 峰顶：温度决定雪线高低，细节噪声让积雪斑驳（真实雪山：有的峰有雪、有的露岩）
             double snow = ContinentIslandField.valueNoise(px, pz, 64, 6006);
-            if (temp < 0.48) return pool.get(FROZEN_PEAKS);                  // 寒：冰封峰顶（禁止积雪山坡）
-            if (temp < 0.72) return snow > 0.52 ? pool.get(1) : pool.get(0);  // 温：积雪斑驳（尖峭雪顶/裸岩）
-            return pool.get(0);                                               // 热：秃岩峰
+            if (temp < 0.48) return applySectorRules(pool.get(FROZEN_PEAKS), sector, px, pz, fallback);
+            Holder<Biome> top = (snow > 0.52) ? pool.get(1) : pool.get(0);
+            if (temp < 0.72) return applySectorRules(top, sector, px, pz, fallback);
+            return applySectorRules(pool.get(0), sector, px, pz, fallback);
         }
-        // 樱花树林点缀（山脚/山腰的低海拔区）
         double cherry = ContinentIslandField.valueNoise(px, pz, 90, 5005);
         if (cherry > 0.80 && mask < 0.48) {
-            return pool.get(CHERRY_GROVE);
+            return applySectorRules(pool.get(CHERRY_GROVE), sector, px, pz, fallback);
         }
         if (mask > 0.36) {
-            // 山腰：雪线只出现在高寒段，其余是高山草甸/山坡针叶林（不是整片雪白）
-            if (temp < 0.66) return pool.get(13);  // 高山草甸（禁止积雪山坡）
-            return taigaWithVariants(px, pz, pool); // 山坡针叶林（含原始变种）
+            if (temp < 0.66) return applySectorRules(pool.get(13), sector, px, pz, fallback);
+            Holder<Biome> taiga = taigaWithVariants(px, pz, pool);
+            return applySectorRules(taiga, sector, px, pz, fallback);
         }
-        // 山脚/山谷：气候驱动的低地群系
-        if (temp < 0.30) return taigaWithVariants(px, pz, pool); // 针叶林（含原始变种）
-        if (temp < 0.60) return pool.get(13);  // 草甸
-        return pool.get(10);                    // 森林
+        if (temp < 0.30) return applySectorRules(taigaWithVariants(px, pz, pool), sector, px, pz, fallback);
+        if (temp < 0.60) return applySectorRules(pool.get(13), sector, px, pz, fallback);
+        return applySectorRules(pool.get(10), sector, px, pz, fallback);
     }
 
     /**
-     * 普通大陆群系：大尺度温度/湿度噪声驱动的平原/森林变体 + 少量小斑块（竹林/红树林/石岸）+ 可选边缘环山。
+     * 普通大陆群系：大尺度温度/湿度噪声驱动的平原/森林变体 + 少量小斑块 + 可选边缘环山。
+     * 此方法可能被以下场景调用：
+     *   a) pickMainlandBiome 中「无扇区命中（扇区间隙/环山带外）」分支 → 此时不是扇区内部
+     *   b) 扇区 2（群岛）分支 2（陆地）调用 → 群岛扇区本体（sector=2）
+     *   c) 其他扇区内部（通过 sectorBiome → 山脉分级/群岛之外不会走到这）；但过渡扇区间隙一般是大陆非扇区
+     * 为避免把「非扇区大陆」误传 sector，我们先判定是否在扇区命中，再决定过滤。
      */
     private Holder<Biome> baseMainlandBiome(double px, double pz, double dist, double angle, List<Holder<Biome>> pool) {
-        // 边缘环山带（配置默认开启）：山峰系群系，与 RingMountain 地形抬升带（0.97R~1.0R）对齐，
-        // 群系从 0.95R 开始（略提前于地形抬升，保证过渡自然）
+        boolean inSC = dist < this.radius + this.transition;
+        boolean ringHit = ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95;
+        int secAt = sectorAt(px, pz);
+        Holder<Biome> fallback = pool.get(9); // 兜底：平原
+
+        // 环山带（命中 = RestrictRegion.RING_MOUNTAIN 独立 + 同时若在扇区角度内，也参与扇区 only_biomes 并集）
         if (ContinentIslandField.ringMountainEnabled && dist > this.radius * 0.95) {
             double temp = ContinentIslandField.valueNoise(px, pz, 400, 707);
-            if (temp < 0.35) return pool.get(2);  // 冰封山峰
-            if (temp < 0.60) return pool.get(0);  // 裸岩山峰
-            return pool.get(1);                    // 尖峭山峰
+            Holder<Biome> cand;
+            if (temp < 0.35) cand = pool.get(2);
+            else if (temp < 0.60) cand = pool.get(0);
+            else cand = pool.get(1);
+            // 环山带命中：ringMountainHit=true，同时若在某扇区角度内，sector=该扇区（取并集）
+            return applyBiomeRules(cand, inSC, false, false, true, secAt, fallback);
         }
 
         double temp = ContinentIslandField.valueNoise(px, pz, 400, 707);
         double humid = ContinentIslandField.valueNoise(px, pz, 400, 808);
 
-        // 小斑块：直径约 25~100 格，少量点缀（同一种子噪声，按气候条件分流）
+        // 小斑块
         double spot = ContinentIslandField.valueNoise(px, pz, 55, 1001);
         if (spot > 0.88) {
-            // 竹林：只在丛林扇区（扇区 1）30° 范围内生成，降低概率
             double jungleCenter = ContinentIslandField.sectorCenterAngle(1);
             double angleDelta = Math.abs(Math.atan2(Math.sin(angle - jungleCenter), Math.cos(angle - jungleCenter)));
             if (angleDelta < Math.toRadians(30.0) && temp > 0.45 && temp < 0.75 && humid > 0.55) {
-                return pool.get(16);   // 竹林
+                return applyBiomeRules(pool.get(16), inSC, false, false, ringHit, secAt, fallback);
             }
-            // 红树林/沼泽不再在普通大陆随机生成——作为丛林扇区（雨林）的附属群系生成
-            if (dist > this.radius * 0.85) return pool.get(18);                      // 石岸
+            if (dist > this.radius * 0.85) {
+                return applyBiomeRules(pool.get(18), inSC, false, false, ringHit, secAt, fallback);
+            }
         }
 
-        // 樱花树林：只在中心核心区域（dist < 0.30R）稀疏小面积生成（类似竹林的少量点缀逻辑）
+        // 樱花树林：只在中心核心区
         if (dist < this.radius * 0.30) {
             double cherrySpot = ContinentIslandField.valueNoise(px, pz, 90, 1004);
             if (cherrySpot > 0.86 && temp > 0.50 && temp < 0.85) {
-                return pool.get(CHERRY_GROVE);  // 樱花树林
+                return applyBiomeRules(pool.get(CHERRY_GROVE), inSC, false, false, ringHit, secAt, fallback);
             }
         }
 
-        // 温带/大陆气候：平原类与森林类群系总体约 1:1
+        // 温带/大陆气候
         if (temp < 0.30) {
-            // 寒冷：针叶林与平原（寒带平原）约各半；针叶林混入原始针叶林变种
-            if (humid < 0.40) return pool.get(9);   // 平原
-            return taigaWithVariants(px, pz, pool); // 针叶林（含变种）
+            if (humid < 0.40) return applyBiomeRules(pool.get(9), inSC, false, false, ringHit, secAt, fallback);
+            return applyBiomeRules(taigaWithVariants(px, pz, pool), inSC, false, false, ringHit, secAt, fallback);
         }
         if (temp < 0.60) {
-            // 温带：平原为主（0.45 内），森林/桦木/黑森林按湿度递增
             if (humid < 0.45) {
-                // 平原偶尔混入向日葵平原（平原变种，约 10%）
                 if (ContinentIslandField.valueNoise(px, pz, 260, 3003) < 0.10) {
-                    return pool.get(15);
+                    return applyBiomeRules(pool.get(15), inSC, false, false, ringHit, secAt, fallback);
                 }
-                return pool.get(9);   // 平原
+                return applyBiomeRules(pool.get(9), inSC, false, false, ringHit, secAt, fallback);
             }
             if (humid < 0.75) {
-                // 森林：中央核心区小尺度混入桦木/黑森林小块，避免整片森林过于单调
                 if (dist < this.radius * 0.35) {
                     double mix = ContinentIslandField.valueNoise(px, pz, 70, 3004);
-                    if (mix < 0.25) return birchWithVariants(px, pz, pool); // 小块桦木（含变种）
-                    if (mix > 0.85) return pool.get(12);                    // 小块黑森林
+                    if (mix < 0.25) return applyBiomeRules(birchWithVariants(px, pz, pool), inSC, false, false, ringHit, secAt, fallback);
+                    if (mix > 0.85) return applyBiomeRules(pool.get(12), inSC, false, false, ringHit, secAt, fallback);
                 }
-                return pool.get(10);  // 森林
+                return applyBiomeRules(pool.get(10), inSC, false, false, ringHit, secAt, fallback);
             }
             if (humid < 0.90) {
-                return birchWithVariants(px, pz, pool); // 桦木林（含原始桦木变种）
+                return applyBiomeRules(birchWithVariants(px, pz, pool), inSC, false, false, ringHit, secAt, fallback);
             }
-            return pool.get(12);      // 黑森林
+            return applyBiomeRules(pool.get(12), inSC, false, false, ringHit, secAt, fallback);
         }
         if (temp < 0.85) {
-            // 暖温带：草甸/森林/繁花森林，中央核心区同样小尺度混杂
-            if (humid < 0.40) return pool.get(13);  // 草甸
+            if (humid < 0.40) return applyBiomeRules(pool.get(13), inSC, false, false, ringHit, secAt, fallback);
             if (humid < 0.70) {
                 if (dist < this.radius * 0.35) {
                     double mix = ContinentIslandField.valueNoise(px, pz, 70, 3006);
-                    if (mix < 0.25) return birchWithVariants(px, pz, pool); // 小块桦木
-                    if (mix > 0.85) return pool.get(14);                    // 小块繁花森林
+                    if (mix < 0.25) return applyBiomeRules(birchWithVariants(px, pz, pool), inSC, false, false, ringHit, secAt, fallback);
+                    if (mix > 0.85) return applyBiomeRules(pool.get(14), inSC, false, false, ringHit, secAt, fallback);
                 }
-                return pool.get(10);  // 森林
+                return applyBiomeRules(pool.get(10), inSC, false, false, ringHit, secAt, fallback);
             }
-            return pool.get(14);       // 繁花森林
+            return applyBiomeRules(pool.get(14), inSC, false, false, ringHit, secAt, fallback);
         }
-        return pool.get(15); // 向日葵平原
+        return applyBiomeRules(pool.get(15), inSC, false, false, ringHit, secAt, fallback);
     }
 
     /** 针叶林（含变种）：原始松木/原始云杉针叶林约 30% 概率替换普通针叶林（更巨大、更高的针叶树） */

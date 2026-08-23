@@ -1018,20 +1018,18 @@ public final class ContinentIslandField {
      * <ul>
      *   <li>内缘（靠内海侧）：大幅噪声扭曲（±0.045R）且只向外弯——湿地带向内海方向
      *       伸出海湾/岬角，不向内收缩，形成犬牙交错的自然岸线</li>
-     *   <li>外缘（靠环山带侧）：仅小幅扭曲（±0.015R），保持贴环山带墙脚的平顺衔接</li>
+     *   <li>外缘（靠环山带侧）：不扭曲，外缘固定 0.98R，贴环山带墙脚的平顺衔接</li>
      *   <li>角度域：乘 {@link #islandSectorAngMask}，湿地带只在群岛扇区（扇区 2）出现，
      *       与地形侧 ArchipelagoWetland 的角度限制完全一致</li>
      * </ul>
      */
     public static double archipelagoWetlandBand(double x, double z, double radius) {
         double dist = Math.sqrt(x * x + z * z);
-        // 内缘大幅扭曲且只向外（内海方向）延伸；外缘小幅扭曲保持贴环山带
+        // 内缘（内海方向）大幅扭曲且只向外（半径增大方向）延伸；外缘（环形山方向）不扭曲，贴环山带保持平滑
         double warpIn = Math.min(0.0, (valueNoise(x, z, 280, 9200) - 0.5) * 2.0 * radius * 0.045);
-        double warpOut = (valueNoise(x, z, 220, 9201) - 0.5) * 2.0 * radius * 0.015;
         double detIn = Math.min(0.0, (valueNoise(x, z, 60, 9202) - 0.5) * 2.0 * radius * 0.008);
-        double detOut = (valueNoise(x, z, 80, 9203) - 0.5) * 2.0 * radius * 0.005;
         double lo = radius * 0.80 + warpIn + detIn;
-        double hi = radius * 0.98 + warpOut + detOut;
+        double hi = radius * 0.98; // 外缘固定 0.98R，无扭曲（环形山方向平顺）
         // 窄过渡带：主体区域 band≈1.0，仅边界平滑衰减（内缘 ~42 格、外缘 ~34 格）
         double inEdge = radius * 0.010;
         double outEdge = radius * 0.008;

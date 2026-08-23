@@ -1,0 +1,39 @@
+{
+  "type": "minecraft:range_choice",
+  "input": "continents_and_isles:overworld/archipelago_transition",
+  "min_inclusive": 0.10,
+  "max_exclusive": 0.90,
+  "when_in_range": {
+    "type": "minecraft:add",
+    "argument1": "continents_and_isles:overworld/sloped_cheese_original",
+    "argument2": {
+      "type": "minecraft:mul",
+      "argument1": {
+        "type": "minecraft:add",
+        "argument1": "continents_and_isles:overworld/flat_64",
+        "argument2": {
+          "type": "minecraft:mul",
+          "argument1": -1.0,
+          "argument2": "continents_and_isles:overworld/sloped_cheese_original"
+        }
+      },
+      "argument2": {
+        "type": "minecraft:mul",
+        "argument1": {
+          "type": "minecraft:add",
+          "argument1": "continents_and_isles:overworld/archipelago_transition",
+          "argument2": -0.10
+        },
+        "argument2": 1.25
+      }
+    }
+  },
+  "when_out_of_range": {
+    "type": "minecraft:range_choice",
+    "input": "continents_and_isles:overworld/archipelago_transition",
+    "min_inclusive": 0.90,
+    "max_exclusive": 1000000.0,
+    "when_in_range": "continents_and_isles:overworld/flat_64",
+    "when_out_of_range": "continents_and_isles:overworld/sloped_cheese_original"
+  }
+}

@@ -36,8 +36,10 @@ public class ContinentsAndIslesMod {
         modEventBus.addListener(ContinentsAndIslesMod::registerWorldgenTypes);
         NeoForge.EVENT_BUS.addListener(ContinentsAndIslesMod::onServerAboutToStart);
 
-        // 【开发调试】启动前按需删除配置文件，必须在 registerConfig 之前执行。
-        tryResetConfigBeforeRegister();
+        // 【正式版】已关闭自动删除/重置配置：玩家在 config/continents_and_isles.toml 中
+        // 修改过的配置会被保留，不会在每次启动时被强制覆盖为默认值。
+        // 【开发调试】如需临时重置配置，取消下面一行的注释即可（或加 JVM 参数 -Dcai.keep.config=false）。
+        // tryResetConfigBeforeRegister();
 
         modContainer.registerConfig(ModConfig.Type.COMMON, CAIConfig.SPEC);
     }

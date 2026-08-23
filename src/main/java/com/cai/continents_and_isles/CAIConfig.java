@@ -70,8 +70,30 @@ public final class CAIConfig {
     // ── 边缘环山 ──
     public static final ModConfigSpec.BooleanValue RING_MOUNTAIN_ENABLED;
 
-    // ── 外岛群系黑名单：这些群系不会出现在超大陆之外的岛屿上（大陆扇区/湖/群岛扇区内部不受影响）
+    // ── 群系生成限制规则（biome_rules）──
+    // A. 超大陆整体黑名单（最高优先级：列入的群系完全不能在超大陆范围内出现）
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SUPERCONTINENT_BIOME_BLACKLIST;
+    // B. 外海群岛黑名单（禁止出现在 dist > R+transition 的外岛上）
     public static final ModConfigSpec.ConfigValue<List<? extends String>> OUTER_ISLAND_BIOME_BLACKLIST;
+    // C. 环山带
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> RING_MOUNTAIN_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> RING_MOUNTAIN_ONLY_BIOMES;
+    // D. 6 扇区各 2 项（黑名单 + only_biomes）
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_0_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_0_ONLY_BIOMES;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_1_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_1_ONLY_BIOMES;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_2_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_2_ONLY_BIOMES;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_3_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_3_ONLY_BIOMES;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_4_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_4_ONLY_BIOMES;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_5_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> SECTOR_5_ONLY_BIOMES;
+    // E. 群岛扇区·内部小岛（独立于扇区本体 & 外岛）
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> ARCHIPELAGO_INNER_ISLAND_BIOME_BLACKLIST;
+    public static final ModConfigSpec.ConfigValue<List<? extends String>> ARCHIPELAGO_INNER_ISLAND_ONLY_BIOMES;
 
     public static final ModConfigSpec SPEC;
 
@@ -110,13 +132,6 @@ public final class CAIConfig {
                      "1.0 = 远近相同；>1 = 远海更多；<1 = 远海更少；0 = 远海无岛。",
                      "默认 1.35 → 远海额外加密约 35%，岛屿也略大。")
             .defineInRange("far_island_chance_multiplier", 1.35, 0.0, 3.0);
-        OUTER_ISLAND_BIOME_BLACKLIST = BUILDER
-            .comment("外岛群系黑名单（资源定位符），被列出的群系不会出现在超大陆之外的岛屿上。",
-                     "大陆扇区、三湖、群岛扇区内部的小岛、山脉/雪原分级群系不受影响。",
-                     "示例：[\"minecraft:cherry_grove\", \"minecraft:ice_spikes\"]")
-            .defineList("outer_island_biome_blacklist",
-                List.of(),
-                o -> o instanceof String);
         BUILDER.pop();
 
         BUILDER.push("lake");
@@ -241,6 +256,105 @@ public final class CAIConfig {
                                                "开启后整个超大陆被高山环绕，外侧断崖入海",
                                                "修改后需重新创建世界才生效")
                                        .define("ring_mountain_enabled", true);
+        BUILDER.pop();
+
+        BUILDER.comment(
+            "群系生成限制规则（资源定位符格式 minecraft:xxx）。",
+            "所有群系限制都是【收紧】不会放宽硬编码约束。",
+            "",
+            "优先级（自上而下）：",
+            "  ① supercontinent_biome_blacklist：列入的群系在整个超大陆内一律禁止（最高优先级）。",
+            "  ② outer_island_biome_blacklist：禁止出现在外海群岛（大陆之外的岛屿）上。",
+            "  ③ 各区域独立黑名单（环山带 / 6 扇区 / 群岛内岛）。",
+            "  ④ 多区域 only_biomes 白名单并集：同一群系写进多个区域的 only_biomes = 只允许出现在这些区域。",
+            "",
+            "注意：群岛扇区分成两块，各有独立配置、互不影响：",
+            "  · 群岛扇区本体（内海面/沙滩带/压低带/湿地带/扇区陆地）：使用 sector_2_*",
+            "  · 群岛扇区内部小岛（散布在内海中的小岛，含中心蘑菇岛）：使用 archipelago_inner_island_*",
+            "修改后需重新创建世界才生效。"
+        ).push("biome_rules");
+
+        // A. 超大陆整体
+        SUPERCONTINENT_BIOME_BLACKLIST = BUILDER
+            .comment("A. 超大陆整体黑名单（最高优先级）。",
+                     "列入的群系完全不能在超大陆范围内（dist < R + transition）出现——",
+                     "包含所有 6 扇区、环山带、三湖、群岛内岛、扇区间隙。",
+                     "只允许出现在超大陆之外（外海群岛、远海）。",
+                     "示例：[\"minecraft:ice_spikes\", \"minecraft:mushroom_fields\"]")
+            .defineList("supercontinent_biome_blacklist",
+                List.of(),
+                o -> o instanceof String);
+
+        // B. 外海群岛
+        OUTER_ISLAND_BIOME_BLACKLIST = BUILDER
+            .comment("B. 外海群岛黑名单。",
+                     "列入的群系禁止出现在 dist > R + transition 的外海岛屿上，只能留在超大陆内。",
+                     "注意：群岛扇区内部小岛（archipelago_inner_island_*）不受此项影响。",
+                     "示例：[\"minecraft:cherry_grove\"] 不许樱花林漂去外岛")
+            .defineList("outer_island_biome_blacklist",
+                List.of(),
+                o -> o instanceof String);
+
+        // C. 环山带（独立于 6 扇区，dist > 0.95R 的环形高山带）
+        RING_MOUNTAIN_BIOME_BLACKLIST = BUILDER
+            .comment("C. 环山带（dist > 0.95R 的环形高山带，独立于 6 扇区）黑名单。",
+                     "列入的群系不许出现在环山带（可同时用 sector_*_blacklist 控制环山带在某扇区角度段的群系，",
+                     "但环山带判定优先于扇区——此处是通用层）。")
+            .defineList("ring_mountain_biome_blacklist",
+                List.of(),
+                o -> o instanceof String);
+        RING_MOUNTAIN_ONLY_BIOMES = BUILDER
+            .comment("环山带 only_biomes：列入的群系【只允许】出现在环山带。",
+                     "如果同一群系也写进其他区域的 only_biomes（如 sector_0_only_biomes），",
+                     "则表示该群系允许出现在【所有命中的 only_biomes 区域的并集】中，其余地方排除。")
+            .defineList("ring_mountain_only_biomes",
+                List.of(),
+                o -> o instanceof String);
+
+        // D. 6 扇区各 2 项
+        // 扇区 0 山脉
+        SECTOR_0_BIOME_BLACKLIST = BUILDER.comment("D-0. 扇区 0（山脉）黑名单：这些群系不许出现在山脉扇区。")
+                                          .defineList("sector_0_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_0_ONLY_BIOMES    = BUILDER.comment("扇区 0（山脉）only_biomes：这些群系只允许出现在山脉扇区（或与其他区域 only_biomes 并集）。")
+                                        .defineList("sector_0_only_biomes", List.of(), o -> o instanceof String);
+        // 扇区 1 丛林
+        SECTOR_1_BIOME_BLACKLIST = BUILDER.comment("D-1. 扇区 1（丛林）黑名单。")
+                                          .defineList("sector_1_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_1_ONLY_BIOMES    = BUILDER.comment("扇区 1（丛林）only_biomes。")
+                                        .defineList("sector_1_only_biomes", List.of(), o -> o instanceof String);
+        // 扇区 2 群岛本体（不含内部小岛）
+        SECTOR_2_BIOME_BLACKLIST = BUILDER.comment("D-2. 扇区 2（群岛扇区本体：内海面/沙滩/压低/湿地带）黑名单。",
+                                                   "注意：群岛扇区内部小岛不受此限制——请使用 archipelago_inner_island_*。")
+                                          .defineList("sector_2_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_2_ONLY_BIOMES    = BUILDER.comment("扇区 2（群岛扇区本体）only_biomes。")
+                                        .defineList("sector_2_only_biomes", List.of(), o -> o instanceof String);
+        // 扇区 3 沙漠
+        SECTOR_3_BIOME_BLACKLIST = BUILDER.comment("D-3. 扇区 3（沙漠）黑名单。")
+                                          .defineList("sector_3_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_3_ONLY_BIOMES    = BUILDER.comment("扇区 3（沙漠）only_biomes。")
+                                        .defineList("sector_3_only_biomes", List.of(), o -> o instanceof String);
+        // 扇区 4 热带草原
+        SECTOR_4_BIOME_BLACKLIST = BUILDER.comment("D-4. 扇区 4（热带草原）黑名单。")
+                                          .defineList("sector_4_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_4_ONLY_BIOMES    = BUILDER.comment("扇区 4（热带草原）only_biomes。")
+                                        .defineList("sector_4_only_biomes", List.of(), o -> o instanceof String);
+        // 扇区 5 雪原
+        SECTOR_5_BIOME_BLACKLIST = BUILDER.comment("D-5. 扇区 5（雪原）黑名单。")
+                                          .defineList("sector_5_biome_blacklist", List.of(), o -> o instanceof String);
+        SECTOR_5_ONLY_BIOMES    = BUILDER.comment("扇区 5（雪原）only_biomes。")
+                                        .defineList("sector_5_only_biomes", List.of(), o -> o instanceof String);
+
+        // E. 群岛扇区·内部小岛（完全独立）
+        ARCHIPELAGO_INNER_ISLAND_BIOME_BLACKLIST = BUILDER
+            .comment("E. 群岛扇区·内部小岛 黑名单。",
+                     "群岛内岛独立判定——不受 outer_island_biome_blacklist（外岛）、",
+                     "不受 sector_2_biome_blacklist（群岛扇区本体）的影响。",
+                     "但仍受 supercontinent_biome_blacklist 与 only_biomes 并集约束。")
+            .defineList("archipelago_inner_island_biome_blacklist", List.of(), o -> o instanceof String);
+        ARCHIPELAGO_INNER_ISLAND_ONLY_BIOMES = BUILDER
+            .comment("群岛扇区·内部小岛 only_biomes：列入的群系只允许出现在群岛内岛（或与其他区域 only_biomes 并集）。")
+            .defineList("archipelago_inner_island_only_biomes", List.of(), o -> o instanceof String);
+
         BUILDER.pop();
 
         SPEC = BUILDER.build();
